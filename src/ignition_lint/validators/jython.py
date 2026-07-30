@@ -148,16 +148,23 @@ class JythonValidator:
         self.issues: list[JythonIssue] = []
 
     def validate_script(
-        self, script_content: str, context: str = "script"
+        self, script_content: str, context: str = "script", standalone: bool = False
     ) -> list[LintIssue]:
-        """Validate a script and return normalized lint issues."""
+        """Validate a script and return normalized lint issues.
+
+        When *standalone* is True the script has already been dedented for
+        editing (e.g. by ignition-lsp) — indentation checks are skipped and
+        syntax checking avoids a redundant ``textwrap.dedent``.
+        """
         self.issues = []
 
         if not script_content or not script_content.strip():
             return []
 
-        self._check_indentation(script_content, context)
-        self._check_syntax(script_content, context)
+        self._check_indentation(script_content, context, standalone=standalone)
+        tree = self._check_syntax(script_content, context, standalone=standalone)
+        if tree is not None:
+            self._check_duplicate_definitions(tree, context)
         self._check_ignition_patterns(script_content, context)
         self._check_java_imports(script_content, context)
 
@@ -176,12 +183,19 @@ class JythonValidator:
             )
         return lint_issues
 
-    def _check_indentation(self, script: str, context: str) -> None:
+    def _check_indentation(
+        self, script: str, context: str, standalone: bool = False
+    ) -> None:
         # Skip indentation heuristics for standalone .py files. Python's own
         # compiler (in _check_syntax) catches real errors; our custom checks
         # are only useful for embedded scripts in JSON event handlers.
         is_standalone = context.endswith(".py") or ".py]" in context
         if is_standalone:
+            return
+
+        # Skip for dedented virtual buffer scripts — indentation was
+        # stripped for editing and will be re-added on save
+        if standalone:
             return
 
         lines = script.split("\n")
@@ -274,22 +288,30 @@ class JythonValidator:
                 )
             )
 
-    def _check_syntax(self, script: str, context: str) -> None:
+    def _check_syntax(
+        self, script: str, context: str, standalone: bool = False
+    ) -> ast.Module | None:
         # Script transforms are stored with leading tab indentation inside an
         # implicit function body.  When triple-quoted strings break
         # textwrap.dedent() common-prefix detection, ast.parse() fails.
         # Wrap transforms in a def so the indentation is valid Python.
         is_transform = "transform[" in context
         if is_transform:
-            prepared = f"def _transform(self, value, quality, timestamp):\n{script}"
+            # Standalone transforms are already dedented — re-indent so the
+            # body is valid inside the wrapper function.
+            body = textwrap.indent(script, "    ") if standalone else script
+            prepared = f"def _transform(self, value, quality, timestamp):\n{body}"
             prepared = _preprocess_py2(prepared)
+        elif standalone:
+            # Already dedented — parse directly
+            prepared = _preprocess_py2(script)
         else:
             # Ignition stores inline scripts with leading indentation; dedent before parsing
             prepared = _preprocess_py2(textwrap.dedent(script))
 
         line_offset = -1 if is_transform else 0
         try:
-            ast.parse(prepared)
+            tree = ast.parse(prepared)
         except SyntaxError as exc:
             reported_line = max(1, (exc.lineno or 1) + line_offset)
             self.issues.append(
@@ -301,6 +323,7 @@ class JythonValidator:
                     line_number=reported_line,
                 )
             )
+            return None
         except Exception as exc:
             self.issues.append(
                 JythonIssue(
@@ -310,6 +333,69 @@ class JythonValidator:
                     suggestion="Check script for syntax issues.",
                 )
             )
+            return None
+        return tree
+
+    def _check_duplicate_definitions(self, tree: ast.Module, context: str) -> None:
+        """Flag functions or classes defined more than once at the same scope."""
+        line_offset = -1 if "transform[" in context else 0
+
+        def _check_scope(body: list[ast.stmt], scope_label: str) -> None:
+            seen: dict[str, int] = {}  # name -> first line number
+            for node in body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    name = node.name
+                    line = node.lineno + line_offset
+                    if name in seen:
+                        first_line = seen[name]
+                        self.issues.append(
+                            JythonIssue(
+                                severity=LintSeverity.WARNING,
+                                code="JYTHON_DUPLICATE_DEFINITION",
+                                message=(
+                                    f"Function '{name}' is defined again{scope_label}"
+                                    f" (first defined on line {first_line})"
+                                ),
+                                suggestion=(
+                                    f"Remove or rename one of the '{name}' definitions — "
+                                    f"the second silently overwrites the first."
+                                ),
+                                line_number=line,
+                            )
+                        )
+                    else:
+                        seen[name] = line
+                elif isinstance(node, ast.ClassDef):
+                    name = node.name
+                    line = node.lineno + line_offset
+                    if name in seen:
+                        first_line = seen[name]
+                        self.issues.append(
+                            JythonIssue(
+                                severity=LintSeverity.WARNING,
+                                code="JYTHON_DUPLICATE_DEFINITION",
+                                message=(
+                                    f"Class '{name}' is defined again{scope_label}"
+                                    f" (first defined on line {first_line})"
+                                ),
+                                suggestion=(
+                                    f"Remove or rename one of the '{name}' definitions — "
+                                    f"the second silently overwrites the first."
+                                ),
+                                line_number=line,
+                            )
+                        )
+                    else:
+                        seen[name] = line
+
+            # Recurse into class and function bodies
+            for node in body:
+                if isinstance(node, ast.ClassDef):
+                    _check_scope(node.body, f" in class '{node.name}'")
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    _check_scope(node.body, f" in function '{node.name}'")
+
+        _check_scope(tree.body, "")
 
     def _check_ignition_patterns(self, script: str, context: str) -> None:
         if "localhost" in script or "127.0.0.1" in script:
